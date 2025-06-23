@@ -11,49 +11,74 @@ from typing import Optional
 from botocore.exceptions import BotoCoreError, ClientError
 import logging
 from dotenv import load_dotenv
-# Cargar variables del archivo .env
+
+# ======================
+# CONSTANTES Y CONFIGURACIÓN
+# ======================
+
+# Cargar variables de entorno
 load_dotenv()
-# Configuración básica de logging
+
+# Configuración de logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuración de clientes (Manteniendo tus credenciales actuales)
-AWS_ACCESS_KEY = "AWS_ACCESS_KEY_ID"
-AWS_SECRET_KEY = "AWS_SECRET_ACCESS_KEY"
-MONGO_URI = "MONGODB_URI"
+# Formatos de video permitidos
+ALLOWED_VIDEO_FORMATS = ["mp4", "avi", "mov", "mkv", "webm"]
+MAX_FILENAME_LENGTH = 120
 
-# Inicialización de clientes
-s3_client = boto3.client(
-    "s3",
-    aws_access_key_id=AWS_ACCESS_KEY,
-    aws_secret_access_key=AWS_SECRET_KEY,
-    region_name="us-east-1",
-    config=boto3.session.Config(
-        connect_timeout=300,
-        read_timeout=600,
-        retries={'max_attempts': 3}
+# Validación de variables de entorno requeridas
+REQUIRED_ENV_VARS = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "S3_BUCKET", "MONGODB_URI"]
+missing_vars = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
+if missing_vars:
+    raise RuntimeError(f"Faltan variables de entorno requeridas: {', '.join(missing_vars)}")
+
+# Configuración de AWS S3
+try:
+    s3_client = boto3.client(
+        "s3",
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        region_name=os.getenv("AWS_REGION", "us-east-1"),
+        config=boto3.session.Config(
+            connect_timeout=300,
+            read_timeout=600,
+            retries={'max_attempts': 3}
+        )
     )
-)
+    # Prueba de conexión con S3
+    s3_client.head_bucket(Bucket=os.getenv("S3_BUCKET"))
+except (BotoCoreError, ClientError) as e:
+    logger.error(f"Error configurando cliente S3: {str(e)}")
+    raise RuntimeError("Error de configuración AWS S3 - Verifica tus credenciales y configuración")
 
-mongo_client = MongoClient(
-    MONGO_URI,
-    server_api=server_api.ServerApi('1'),
-    connectTimeoutMS=30000,
-    socketTimeoutMS=30000
-)
+# Configuración de MongoDB
+try:
+    mongo_client = MongoClient(
+        os.getenv("MONGODB_URI"),
+        server_api=server_api.ServerApi('1'),
+        connectTimeoutMS=30000,
+        socketTimeoutMS=30000
+    )
+    # Testear conexión a MongoDB
+    mongo_client.admin.command('ping')
+except PyMongoError as e:
+    logger.error(f"Error configurando MongoDB: {str(e)}")
+    raise RuntimeError("Error de configuración MongoDB")
+
+# Inicialización de la base de datos
 db = mongo_client["alertguard"]
 coleccion_videos = db["videos"]
 
+# ======================
+# ROUTER DE FASTAPI
+# ======================
+
 videos = APIRouter(prefix="/api/v1/videos", tags=["Videos"])
 
-# Constantes
-ALLOWED_FORMATS = ["mp4", "avi", "mov", "mkv", "webm"]
-MAX_FILENAME_LENGTH = 120
-BUCKET_NAME = os.getenv("MONGODB_URI")
-
-# ----------------------------
-# Endpoints originales mejorados
-# ----------------------------
+# ======================
+# ENDPOINTS
+# ======================
 
 @videos.get('')
 async def findAllVideos():
@@ -78,7 +103,7 @@ async def findAllVideos():
         )
 
 @videos.post('', status_code=status.HTTP_201_CREATED)
-async def CreateVideo(
+async def create_video(
     nombreVideo: str, 
     anomalia: bool, 
     file: UploadFile = File(...)
@@ -86,11 +111,17 @@ async def CreateVideo(
     """Sube un video a S3 y guarda metadatos en MongoDB"""
     try:
         # Validaciones
-        file_format = file.filename.split(".")[-1].lower()
-        if file_format not in ALLOWED_FORMATS:
+        if not file.filename or "." not in file.filename:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Formato no soportado. Use: {', '.join(ALLOWED_FORMATS)}"
+                detail="El archivo debe tener una extensión válida"
+            )
+
+        file_format = file.filename.split(".")[-1].lower()
+        if file_format not in ALLOWED_VIDEO_FORMATS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Formato no soportado. Formatos permitidos: {', '.join(ALLOWED_VIDEO_FORMATS)}"
             )
 
         # Subida a S3
@@ -98,11 +129,14 @@ async def CreateVideo(
         try:
             s3_client.upload_fileobj(
                 file.file,
-                BUCKET_NAME,
+                os.getenv("S3_BUCKET"),
                 s3_key,
-                ExtraArgs={'ContentType': file.content_type}
+                ExtraArgs={
+                    'ContentType': file.content_type,
+                    'ACL': 'private'  # Cambiar a 'public-read' si necesitas acceso público
+                }
             )
-            url = f"https://{BUCKET_NAME}.s3.amazonaws.com/{s3_key}"
+            url = f"https://{os.getenv('S3_BUCKET')}.s3.amazonaws.com/{s3_key}"
         except (BotoCoreError, ClientError) as e:
             logger.error(f"Error S3: {str(e)}")
             raise HTTPException(
@@ -137,7 +171,7 @@ async def CreateVideo(
             logger.error(f"Error MongoDB: {str(e)}")
             # Intentar limpiar S3 si falla MongoDB
             try:
-                s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
+                s3_client.delete_object(Bucket=os.getenv("S3_BUCKET"), Key=s3_key)
             except Exception as s3_err:
                 logger.error(f"Error limpiando S3: {str(s3_err)}")
             raise HTTPException(
@@ -155,7 +189,7 @@ async def CreateVideo(
         )
 
 @videos.get('/{idVideo}')
-async def findIdVideo(idVideo: str):
+async def find_id_video(idVideo: str):
     """Obtiene un video específico por ID"""
     try:
         if not ObjectId.is_valid(idVideo):
@@ -184,7 +218,7 @@ async def findIdVideo(idVideo: str):
         )
 
 @videos.put('/{idVideo}')
-async def updateVideo(idVideo: str, video: dict):
+async def update_video(idVideo: str, video: dict):
     """Actualiza metadatos de un video"""
     try:
         if not ObjectId.is_valid(idVideo):
@@ -220,7 +254,7 @@ async def updateVideo(idVideo: str, video: dict):
         )
 
 @videos.delete('/{idVideo}')
-async def deleteVideo(idVideo: str):
+async def delete_video(idVideo: str):
     """Elimina un video de S3 y MongoDB"""
     try:
         if not ObjectId.is_valid(idVideo):
@@ -240,7 +274,7 @@ async def deleteVideo(idVideo: str):
         # 2. Eliminar de S3
         try:
             s3_client.delete_object(
-                Bucket=BUCKET_NAME,
+                Bucket=os.getenv("S3_BUCKET"),
                 Key=video["s3_key"]
             )
         except (BotoCoreError, ClientError) as e:
@@ -269,17 +303,15 @@ async def deleteVideo(idVideo: str):
             detail="Error interno al eliminar"
         )
 
-# ----------------------------
-# Nuevo endpoint de prueba
-# ----------------------------
-
 @videos.post("/prueba-s3")
 async def prueba_s3_connection():
     """Endpoint para probar la conexión con AWS S3"""
     try:
-        # Reemplaza list_buckets() por una operación específica a tu bucket
-        s3_client.head_bucket(Bucket=BUCKET_NAME)
-        return {"status": "success", "message": f"Conexión al bucket {BUCKET_NAME} exitosa"}
+        s3_client.head_bucket(Bucket=os.getenv("S3_BUCKET"))
+        return {
+            "status": "success", 
+            "message": f"Conexión al bucket {os.getenv('S3_BUCKET')} exitosa"
+        }
     except (BotoCoreError, ClientError) as e:
         logger.error(f"Error S3: {str(e)}")
         raise HTTPException(
