@@ -1,0 +1,9 @@
+<div>
+  <h3>{{ statusMessage }}</h3>
+
+  <input type="file" (change)="onFileSelected($event)" />
+
+  <div *ngIf="frameUrl" class="video-container">
+    <img [src]="frameUrl" alt="Video en tiempo real" />
+  </div>
+</div>
