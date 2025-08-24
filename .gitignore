@@ -3,3 +3,4 @@ __pycache__/
 *.py[cod]
 credentials.txr
 myenv
+node_modules
